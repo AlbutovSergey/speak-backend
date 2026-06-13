@@ -5,11 +5,15 @@ const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
+});
+
+app.get("/", (req, res) => {
+  res.json({ status: "Speak server is running" });
 });
 
 app.post("/api/register", async (req, res) => {
@@ -59,25 +63,6 @@ app.get("/api/messages/:userId", async (req, res) => {
   const { userId } = req.params;
   const result = await pool.query(
     "SELECT sender_id, encrypted_payload, nonce, timestamp FROM messages WHERE recipient_id = $1 ORDER BY timestamp ASC",
-    [userId]
-  );
-  res.json(result.rows);
-});
-
-app.post("/api/send_file", async (req, res) => {
-  const { fileId, senderId, recipientId, encryptedFileUrl, nonce, fileName, fileSize, mimeType } = req.body;
-  await pool.query(
-    `INSERT INTO files(id, sender_id, recipient_id, encrypted_file_url, nonce, file_name, file_size, mime_type, timestamp)
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [fileId, senderId, recipientId, encryptedFileUrl, nonce, fileName, fileSize, mimeType, Date.now()]
-  );
-  res.json({ success: true });
-});
-
-app.get("/api/files/:userId", async (req, res) => {
-  const { userId } = req.params;
-  const result = await pool.query(
-    "SELECT id, sender_id, encrypted_file_url, nonce, file_name, file_size, mime_type, timestamp FROM files WHERE recipient_id = $1 ORDER BY timestamp ASC",
     [userId]
   );
   res.json(result.rows);
