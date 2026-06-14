@@ -36,14 +36,44 @@ async function verifyPassword(password, hash, salt) {
   return testHash === hash;
 }
 
-function generateToken() {
-  return crypto.randomBytes(32).toString('hex');
+function generateSessionToken(userId) {
+  const randomPart = crypto.randomBytes(32).toString('hex');
+  const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+  const signature = crypto.createHmac('sha256', secret).update(userId + randomPart).digest('hex');
+  return `${userId}.${randomPart}.${signature}`;
 }
 
-// ============ API ЭНДПОИНТЫ (ВСЕ ОТКРЫТЫЕ) ============
+async function verifySessionToken(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [userId, randomPart, signature] = parts;
+  const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+  const expectedSignature = crypto.createHmac('sha256', secret).update(userId + randomPart).digest('hex');
+  if (signature !== expectedSignature) return null;
+  try {
+    const result = await pool.query('SELECT user_id, expires_at FROM sessions WHERE token = $1', [token]);
+    if (result.rows.length === 0) return null;
+    if (result.rows[0].expires_at < Date.now()) {
+      await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+      return null;
+    }
+    return result.rows[0].user_id;
+  } catch (err) { return null; }
+}
+
+async function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const userId = await verifySessionToken(token);
+  if (!userId) return res.status(401).json({ error: 'Invalid or expired token' });
+  req.userId = userId;
+  next();
+}
+
+// ============ API ЭНДПОИНТЫ ============
 
 app.get("/", (req, res) => {
-  res.json({ status: "Speak server is running", version: "2.0" });
+  res.json({ status: "Speak server is running", version: "2.0", timestamp: Date.now() });
 });
 
 // РЕГИСТРАЦИЯ
@@ -66,7 +96,9 @@ app.post("/api/register", async (req, res) => {
       [userId, username, `${hash}.${salt}`, displayName, publicKey, signaturePublicKey, signaturePrivateKey, Date.now()]
     );
     
-    const token = generateToken();
+    const token = generateSessionToken(userId);
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, userId, expiresAt, Date.now()]);
     
     res.json({ success: true, token, userId, username, displayName });
   } catch (err) {
@@ -92,7 +124,12 @@ app.post("/api/login", async (req, res) => {
     const isValid = await verifyPassword(password, hash, salt);
     if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
     
-    const token = generateToken();
+    await pool.query('UPDATE users_auth SET last_login = $1 WHERE id = $2', [Date.now(), user.id]);
+    await pool.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at < $2', [user.id, Date.now()]);
+    
+    const token = generateSessionToken(user.id);
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, user.id, expiresAt, Date.now()]);
     
     res.json({ 
       success: true, 
@@ -150,60 +187,50 @@ app.get("/api/users/search", async (req, res) => {
   }
 });
 
-// ============ СООБЩЕНИЯ (ВСЕ ОТКРЫТЫЕ) ============
-
-// Получить все сообщения
-app.get("/api/messages", async (req, res) => {
+// СООБЩЕНИЯ
+app.post("/api/send_message", authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT m.*, u.username as sender_username, u.display_name as sender_display_name
-       FROM messages m
-       JOIN users_auth u ON m.sender_id = u.id
-       ORDER BY m.timestamp ASC`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Get messages error:', err);
-    res.json([]);
-  }
-});
-
-// Отправить сообщение
-app.post("/api/send_message", async (req, res) => {
-  try {
-    const { recipientUsername, encryptedPayload, nonce, senderUsername } = req.body;
-    console.log("Send message to:", recipientUsername);
-    
-    // Находим отправителя и получателя
-    const sender = await pool.query('SELECT id FROM users_auth WHERE username = $1', [senderUsername || recipientUsername]);
+    const { recipientUsername, encryptedPayload, nonce } = req.body;
     const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
-    
-    if (recipient.rows.length === 0) {
-      return res.status(404).json({ error: "Recipient not found" });
-    }
-    
-    const senderId = sender.rows.length > 0 ? sender.rows[0].id : recipient.rows[0].id;
-    
+    if (recipient.rows.length === 0) return res.status(404).json({ error: "Recipient not found" });
     await pool.query(
-      `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp)
-       VALUES($1, $2, $3, $4, $5)`,
-      [senderId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
+      `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp) VALUES($1, $2, $3, $4, $5)`,
+      [req.userId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
     );
-    
     res.json({ success: true });
   } catch (err) {
-    console.error('Send message error:', err);
+    console.error('Send error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ПРОВЕРКА ТОКЕНА (всегда успешна)
-app.get("/api/verify", (req, res) => {
-  res.json({ valid: true });
+app.get("/api/messages", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp, u.username as sender_username, u.display_name as sender_display_name
+       FROM messages m JOIN users_auth u ON m.sender_id = u.id WHERE m.recipient_id = $1 ORDER BY m.timestamp ASC`,
+      [req.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Messages error:', err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
-// ВЫХОД
-app.post("/api/logout", (req, res) => {
+app.get("/api/verify", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, username, display_name FROM users_auth WHERE id = $1', [req.userId]);
+    if (result.rows.length === 0) return res.status(401).json({ error: "User not found" });
+    res.json({ valid: true, user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/logout", authMiddleware, async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
   res.json({ success: true });
 });
 
