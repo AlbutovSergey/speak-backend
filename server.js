@@ -1,4 +1,4 @@
-// ============ НАСТРОЙКИ СЕТИ ============
+// ============ НАСТРОЙКИ СЕТИ (для Render) ============
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 process.env.NODE_OPTIONS = '--dns-result-order=ipv4first';
@@ -21,7 +21,6 @@ const pool = new Pool({
 });
 
 // ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
-
 async function hashPassword(password, salt = null) {
   if (!salt) salt = crypto.randomBytes(16).toString('hex');
   return new Promise((resolve, reject) => {
@@ -77,7 +76,7 @@ async function initDatabase() {
     console.log('Checking database connection...');
     await pool.query('SELECT NOW()');
     console.log('✅ Database connected');
-    
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users_auth (
         id TEXT PRIMARY KEY,
@@ -125,7 +124,6 @@ async function initDatabase() {
 }
 
 // ============ API ЭНДПОИНТЫ ============
-
 app.get("/", (req, res) => {
   res.json({ status: "Speak server is running", version: "2.0", timestamp: Date.now() });
 });
@@ -227,9 +225,12 @@ app.get("/api/user_info/:username", async (req, res) => {
 app.get("/api/users/search", async (req, res) => {
   try {
     const { q } = req.query;
+    console.log(`Search query: ${q}`);
+    
     if (!q || q.length < 2) {
       return res.json([]);
     }
+    
     const result = await pool.query(
       `SELECT id, username, display_name, public_key 
        FROM users_auth 
@@ -238,6 +239,8 @@ app.get("/api/users/search", async (req, res) => {
        LIMIT 10`,
       [`%${q}%`]
     );
+    
+    console.log(`Found ${result.rows.length} users`);
     res.json(result.rows);
   } catch (err) {
     console.error('Search users error:', err);
