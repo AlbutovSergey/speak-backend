@@ -167,14 +167,30 @@ app.get("/api/public_key/:username", async (req, res) => {
   }
 });
 
-// ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ
+// ПОЛУЧИТЬ ИНФОРМАЦИЮ О ПОЛЬЗОВАТЕЛЕ
 app.get("/api/user_info/:username", async (req, res) => {
   try {
     const { username } = req.params;
-    const result = await pool.query("SELECT id, username, display_name FROM users_auth WHERE username = $1", [username]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    res.json(result.rows[0]);
+    console.log("Get user info for:", username);
+    
+    const result = await pool.query(
+      "SELECT id, username, display_name, public_key, signature_public_key FROM users_auth WHERE username = $1",
+      [username]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    res.json({
+      id: result.rows[0].id,
+      username: result.rows[0].username,
+      display_name: result.rows[0].display_name,
+      public_key: result.rows[0].public_key,
+      signature_public_key: result.rows[0].signature_public_key
+    });
   } catch (err) {
+    console.error('Get user info error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
