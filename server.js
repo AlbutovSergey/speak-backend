@@ -121,6 +121,29 @@ app.get("/api/users/search", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
+// ============ ПОИСК ПОЛЬЗОВАТЕЛЕЙ ПО ОТОБРАЖАЕМОМУ ИМЕНИ ============
+app.get("/api/users/search", async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q || q.length < 2) {
+      return res.json([]);
+    }
+    
+    const result = await pool.query(
+      `SELECT id, username, display_name, public_key 
+       FROM users_auth 
+       WHERE display_name ILIKE $1 
+       ORDER BY display_name ASC 
+       LIMIT 10`,
+      [`%${q}%`]
+    );
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Search users error:', err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Speak server running on port ${PORT}`));
