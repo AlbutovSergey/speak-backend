@@ -277,17 +277,18 @@ app.get("/api/users/search", async (req, res) => {
 });
 
 // ============ СООБЩЕНИЯ ============
-
 // ПОЛУЧИТЬ СООБЩЕНИЯ
 app.get("/api/messages", authMiddleware, async (req, res) => {
   try {
-    // Возвращаем только сообщения, где текущий пользователь - получатель
     const result = await pool.query(
       `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp,
-              u.username as sender_username, u.display_name as sender_display_name
+              u_sender.username as sender_username, 
+              u_sender.display_name as sender_display_name,
+              u_recipient.username as recipient_username
        FROM messages m
-       JOIN users_auth u ON m.sender_id = u.id
-       WHERE m.recipient_id = $1
+       JOIN users_auth u_sender ON m.sender_id = u_sender.id
+       JOIN users_auth u_recipient ON m.recipient_id = u_recipient.id
+       WHERE m.recipient_id = $1 OR m.sender_id = $1
        ORDER BY m.timestamp ASC`,
       [req.userId]
     );
