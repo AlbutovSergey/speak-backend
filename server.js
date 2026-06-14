@@ -1,17 +1,84 @@
+// ============ НАСТРОЙКИ СЕТИ ============
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+process.env.NODE_OPTIONS = '--dns-result-order=ipv4first';
+
 const express = require("express");
+const { Pool } = require("pg");
 const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-// Временное хранилище в памяти
-const users = new Map();
-const messages = [];
+// ============ ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ============
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 30000,
+  idleTimeoutMillis: 30000,
+});
+
+// ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+
+async function hashPassword(password, salt = null) {
+  if (!salt) salt = crypto.randomBytes(16).toString('hex');
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, 100000, 64, 'sha512', (err, derivedKey) => {
+      if (err) reject(err);
+      resolve({ hash: derivedKey.toString('hex'), salt });
+    });
+  });
+}
+
+async function verifyPassword(password, hash, salt) {
+  const { hash: testHash } = await hashPassword(password, salt);
+  return testHash === hash;
+}
+
+function generateSessionToken(userId) {
+  const randomPart = crypto.randomBytes(32).toString('hex');
+  const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+  const signature = crypto.createHmac('sha256', secret).update(userId + randomPart).digest('hex');
+  return `${userId}.${randomPart}.${signature}`;
+}
+
+async function verifySessionToken(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [userId, randomPart, signature] = parts;
+  const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+  const expectedSignature = crypto.createHmac('sha256', secret).update(userId + randomPart).digest('hex');
+  if (signature !== expectedSignature) return null;
+  try {
+    const result = await pool.query('SELECT user_id, expires_at FROM sessions WHERE token = $1', [token]);
+    if (result.rows.length === 0) return null;
+    if (result.rows[0].expires_at < Date.now()) {
+      await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+      return null;
+    }
+    return result.rows[0].user_id;
+  } catch (err) { return null; }
+}
+
+async function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const userId = await verifySessionToken(token);
+  if (!userId) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+  req.userId = userId;
+  next();
+}
+
+// ============ API ЭНДПОИНТЫ ============
 
 app.get("/", (req, res) => {
-  res.json({ status: "Speak server is running", version: "2.0-test" });
+  res.json({ status: "Speak server is running", version: "2.0", timestamp: Date.now() });
 });
 
 // ============ РЕГИСТРАЦИЯ ============
@@ -21,36 +88,42 @@ app.post("/api/register", async (req, res) => {
     
     console.log("Register attempt:", username);
     
-    if (!username || !password || !displayName) {
+    if (!username || !password || !displayName || !publicKey || !signaturePublicKey || !signaturePrivateKey) {
       return res.status(400).json({ error: "All fields required" });
     }
     
-    if (users.has(username)) {
+    if (username.length < 3) return res.status(400).json({ error: "Username too short" });
+    if (displayName.length < 2) return res.status(400).json({ error: "Display name too short" });
+    if (password.length < 6) return res.status(400).json({ error: "Password too short" });
+    
+    const existingUser = await pool.query('SELECT id FROM users_auth WHERE username = $1', [username]);
+    if (existingUser.rows.length > 0) {
       return res.status(409).json({ error: "Username already exists" });
     }
     
+    const existingDisplayName = await pool.query('SELECT id FROM users_auth WHERE display_name = $1', [displayName]);
+    if (existingDisplayName.rows.length > 0) {
+      return res.status(409).json({ error: "Display name already taken" });
+    }
+    
+    const { hash, salt } = await hashPassword(password);
     const userId = crypto.randomBytes(16).toString('hex');
-    users.set(username, { 
-      userId, 
-      username, 
-      displayName: displayName || username, 
-      password,
-      publicKey: publicKey || 'temp-key',
-      signaturePublicKey: signaturePublicKey || 'temp-sig',
-      signaturePrivateKey: signaturePrivateKey || 'temp-priv'
-    });
     
-    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query(
+      `INSERT INTO users_auth(id, username, password_hash, display_name, public_key, signature_public_key, signature_private_key, created_at)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [userId, username, `${hash}.${salt}`, displayName, publicKey, signaturePublicKey, signaturePrivateKey, Date.now()]
+    );
     
-    res.json({ 
-      success: true, 
-      token, 
-      userId, 
-      username, 
-      displayName: displayName || username 
-    });
+    const token = generateSessionToken(userId);
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, userId, expiresAt, Date.now()]);
+    
+    console.log("User registered:", username);
+    
+    res.json({ success: true, token, userId, username, displayName });
   } catch (err) {
-    console.error("Register error:", err);
+    console.error('Registration error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -62,161 +135,188 @@ app.post("/api/login", async (req, res) => {
     
     console.log("Login attempt:", username);
     
-    const user = users.get(username);
-    if (!user || user.password !== password) {
+    if (!username || !password) {
+      return res.status(400).json({ error: "Username and password required" });
+    }
+    
+    const result = await pool.query(
+      'SELECT id, username, password_hash, display_name, public_key, signature_public_key, signature_private_key FROM users_auth WHERE username = $1',
+      [username]
+    );
+    
+    if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
     
-    const token = crypto.randomBytes(32).toString('hex');
+    const user = result.rows[0];
+    const [hash, salt] = user.password_hash.split('.');
+    const isValid = await verifyPassword(password, hash, salt);
+    
+    if (!isValid) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+    
+    await pool.query('UPDATE users_auth SET last_login = $1 WHERE id = $2', [Date.now(), user.id]);
+    await pool.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at < $2', [user.id, Date.now()]);
+    
+    const token = generateSessionToken(user.id);
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, user.id, expiresAt, Date.now()]);
+    
+    console.log("User logged in:", username);
     
     res.json({ 
       success: true, 
       token, 
-      userId: user.userId, 
+      userId: user.id, 
       username: user.username, 
-      display_name: user.displayName,
-      signature_private_key: user.signaturePrivateKey
+      display_name: user.display_name,
+      public_key: user.public_key,
+      signature_public_key: user.signature_public_key,
+      signature_private_key: user.signature_private_key
     });
   } catch (err) {
-    console.error("Login error:", err);
+    console.error('Login error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ============ ПОЛУЧИТЬ ПУБЛИЧНЫЙ КЛЮЧ ============
 app.get("/api/public_key/:username", async (req, res) => {
-  const { username } = req.params;
-  const user = users.get(username);
-  if (!user) {
-    return res.status(404).json({ error: "User not found" });
+  try {
+    const { username } = req.params;
+    console.log("Get public key for:", username);
+    
+    const result = await pool.query("SELECT public_key FROM users_auth WHERE username = $1", [username]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ public_key: result.rows[0].public_key });
+  } catch (err) {
+    console.error('Get public key error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  res.json({ public_key: user.publicKey });
 });
 
 // ============ ПОЛУЧИТЬ ИНФОРМАЦИЮ О ПОЛЬЗОВАТЕЛЕ ============
 app.get("/api/user_info/:username", async (req, res) => {
-  const { username } = req.params;
-  const user = users.get(username);
-  if (!user) {
-    return res.status(404).json({ error: "User not found" });
+  try {
+    const { username } = req.params;
+    console.log("Get user info for:", username);
+    
+    const result = await pool.query("SELECT id, username, display_name, public_key FROM users_auth WHERE username = $1", [username]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Get user info error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  res.json({ 
-    id: user.userId, 
-    username: user.username, 
-    display_name: user.displayName,
-    public_key: user.publicKey
-  });
 });
 
 // ============ ПОИСК ПОЛЬЗОВАТЕЛЕЙ ============
 app.get("/api/users/search", async (req, res) => {
-  const { q } = req.query;
-  if (!q || q.length < 2) {
-    return res.json([]);
-  }
-  
-  const searchLower = q.toLowerCase();
-  const results = [];
-  
-  for (const [username, user] of users) {
-    const displayName = (user.displayName || username).toLowerCase().replace(/^@/, '');
-    if (displayName.includes(searchLower) || username.toLowerCase().includes(searchLower)) {
-      results.push({
-        id: user.userId,
-        username: user.username,
-        display_name: user.displayName || user.username,
-        public_key: user.publicKey
-      });
+  try {
+    const { q } = req.query;
+    console.log("Search users for:", q);
+    
+    if (!q || q.length < 2) {
+      return res.json([]);
     }
+    
+    const result = await pool.query(
+      `SELECT id, username, display_name, public_key 
+       FROM users_auth 
+       WHERE display_name ILIKE $1 
+       ORDER BY display_name ASC 
+       LIMIT 10`,
+      [`%${q}%`]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Search error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  
-  res.json(results.slice(0, 10));
 });
 
 // ============ ОТПРАВИТЬ СООБЩЕНИЕ ============
-app.post("/api/send_message", (req, res) => {
-  const { recipientUsername, encryptedPayload, nonce } = req.body;
-  const authHeader = req.headers.authorization;
-  
-  let senderUsername = null;
-  for (const [username, user] of users) {
-    if (authHeader && authHeader.includes(user.userId)) {
-      senderUsername = username;
-      break;
+app.post("/api/send_message", authMiddleware, async (req, res) => {
+  try {
+    const { recipientUsername, encryptedPayload, nonce } = req.body;
+    console.log("Send message to:", recipientUsername);
+    
+    const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
+    if (recipient.rows.length === 0) {
+      return res.status(404).json({ error: "Recipient not found" });
     }
+    
+    await pool.query(
+      `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp) VALUES($1, $2, $3, $4, $5)`,
+      [req.userId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Send error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  
-  if (!senderUsername) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  
-  messages.push({
-    id: messages.length + 1,
-    sender_username: senderUsername,
-    recipient_username: recipientUsername,
-    encrypted_payload: encryptedPayload,
-    nonce: nonce || '',
-    timestamp: Date.now()
-  });
-  
-  res.json({ success: true });
 });
 
 // ============ ПОЛУЧИТЬ СООБЩЕНИЯ ============
-app.get("/api/messages", (req, res) => {
-  const authHeader = req.headers.authorization;
-  let currentUser = null;
-  
-  for (const [username, user] of users) {
-    if (authHeader && authHeader.includes(user.userId)) {
-      currentUser = username;
-      break;
-    }
+app.get("/api/messages", authMiddleware, async (req, res) => {
+  try {
+    console.log("Get messages for user:", req.userId);
+    
+    const result = await pool.query(
+      `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp, 
+              u.username as sender_username, u.display_name as sender_display_name
+       FROM messages m 
+       JOIN users_auth u ON m.sender_id = u.id 
+       WHERE m.recipient_id = $1 
+       ORDER BY m.timestamp ASC`,
+      [req.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Messages error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  
-  if (!currentUser) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  
-  const userMessages = messages.filter(msg => 
-    msg.recipient_username === currentUser || 
-    msg.sender_username === currentUser
-  );
-  
-  const result = userMessages.map(msg => {
-    const sender = users.get(msg.sender_username);
-    return {
-      id: msg.id,
-      sender_username: msg.sender_username,
-      sender_display_name: sender?.displayName || msg.sender_username,
-      encrypted_payload: msg.encrypted_payload,
-      nonce: msg.nonce,
-      timestamp: msg.timestamp
-    };
-  });
-  
-  res.json(result);
 });
 
-// ============ ПРОВЕРКА ТОКЕНА ============
-app.get("/api/verify", (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  let valid = false;
-  
-  for (const [username, user] of users) {
-    if (token && token.includes(user.userId)) {
-      valid = true;
-      break;
+// ============ ПРОВЕРИТЬ ТОКЕН ============
+app.get("/api/verify", authMiddleware, async (req, res) => {
+  try {
+    console.log("Verify token for user:", req.userId);
+    
+    const result = await pool.query('SELECT id, username, display_name FROM users_auth WHERE id = $1', [req.userId]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "User not found" });
     }
+    res.json({ valid: true, user: result.rows[0] });
+  } catch (err) {
+    console.error('Verify error:', err);
+    res.status(500).json({ error: "Internal server error" });
   }
-  
-  res.json({ valid });
 });
 
 // ============ ВЫХОД ============
-app.post("/api/logout", (req, res) => {
+app.post("/api/logout", authMiddleware, async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
   res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Speak server running on port ${PORT}`));
+
+async function startServer() {
+  try {
+    await pool.query('SELECT NOW()');
+    console.log('✅ Database connected');
+    app.listen(PORT, () => console.log(`✅ Speak server running on port ${PORT}`));
+  } catch (err) {
+    console.error('❌ Database connection error:', err.message);
+    process.exit(1);
+  }
+}
+
+startServer();
