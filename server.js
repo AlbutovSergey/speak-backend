@@ -40,7 +40,7 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// ============ API ЭНДПОИНТЫ ============
+// ============ API ЭНДПОИНТЫ (ВСЕ ОТКРЫТЫЕ) ============
 
 app.get("/", (req, res) => {
   res.json({ status: "Speak server is running", version: "2.0" });
@@ -150,20 +150,59 @@ app.get("/api/users/search", async (req, res) => {
   }
 });
 
-// ============ СООБЩЕНИЯ (ВРЕМЕННАЯ ЗАГЛУШКА) ============
+// ============ СООБЩЕНИЯ (ВСЕ ОТКРЫТЫЕ) ============
 
-app.get("/api/messages", (req, res) => {
-  res.json([]);
+// Получить все сообщения
+app.get("/api/messages", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT m.*, u.username as sender_username, u.display_name as sender_display_name
+       FROM messages m
+       JOIN users_auth u ON m.sender_id = u.id
+       ORDER BY m.timestamp ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get messages error:', err);
+    res.json([]);
+  }
 });
 
-app.post("/api/send_message", (req, res) => {
-  res.json({ success: true });
+// Отправить сообщение
+app.post("/api/send_message", async (req, res) => {
+  try {
+    const { recipientUsername, encryptedPayload, nonce, senderUsername } = req.body;
+    console.log("Send message to:", recipientUsername);
+    
+    // Находим отправителя и получателя
+    const sender = await pool.query('SELECT id FROM users_auth WHERE username = $1', [senderUsername || recipientUsername]);
+    const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
+    
+    if (recipient.rows.length === 0) {
+      return res.status(404).json({ error: "Recipient not found" });
+    }
+    
+    const senderId = sender.rows.length > 0 ? sender.rows[0].id : recipient.rows[0].id;
+    
+    await pool.query(
+      `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp)
+       VALUES($1, $2, $3, $4, $5)`,
+      [senderId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Send message error:', err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
+// ПРОВЕРКА ТОКЕНА (всегда успешна)
 app.get("/api/verify", (req, res) => {
   res.json({ valid: true });
 });
 
+// ВЫХОД
 app.post("/api/logout", (req, res) => {
   res.json({ success: true });
 });
