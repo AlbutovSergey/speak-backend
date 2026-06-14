@@ -10,14 +10,14 @@ const app = express();
 
 // -------------------------- Безопасность --------------------------
 app.use(helmet());
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+app.use(cors({ origin: '*' })); // Для разработки, в продакшене ограничьте
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 
 // -------------------------- База данных --------------------------
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // ВАЖНО: для разработки, в продакшене должен быть true с корректным сертификатом
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/speak_db',
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 // -------------------------- Инициализация БД --------------------------
@@ -51,16 +51,16 @@ const initDb = async () => {
                 created_at BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
         `);
-        console.log("✅ Database initialized");
+        console.log("✅ Database initialized successfully");
     } catch (err) {
         console.error("❌ Database initialization error:", err);
+        process.exit(1);
     } finally {
         client.release();
     }
 };
-
-initDb().catch(console.error);
 
 // -------------------------- Вспомогательные функции --------------------------
 async function hashPassword(password, salt = null) {
@@ -75,13 +75,12 @@ async function hashPassword(password, salt = null) {
 
 async function verifyPassword(password, hash, salt) {
     const { hash: testHash } = await hashPassword(password, salt);
-    // Use timing-safe comparison
-    return crypto.timingSafeEqual(Buffer.from(testHash), Buffer.from(hash));
+    return crypto.timingSafeEqual(Buffer.from(testHash, 'hex'), Buffer.from(hash, 'hex'));
 }
 
 function generateSessionToken(userId) {
     const randomPart = crypto.randomBytes(32).toString('hex');
-    const signature = crypto.createHmac('sha256', process.env.SESSION_SECRET || 'speak_secret')
+    const signature = crypto.createHmac('sha256', process.env.SESSION_SECRET || 'speak_secret_key_2024')
         .update(userId + randomPart).digest('hex');
     return `${userId}.${randomPart}.${signature}`;
 }
@@ -90,7 +89,7 @@ async function verifySessionToken(token) {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
     const [userId, randomPart, signature] = parts;
-    const expectedSignature = crypto.createHmac('sha256', process.env.SESSION_SECRET || 'speak_secret')
+    const expectedSignature = crypto.createHmac('sha256', process.env.SESSION_SECRET || 'speak_secret_key_2024')
         .update(userId + randomPart).digest('hex');
     if (signature !== expectedSignature) return null;
 
@@ -114,7 +113,7 @@ async function authMiddleware(req, res, next) {
 
 // -------------------------- API Endpoints --------------------------
 app.get("/", (req, res) => {
-    res.json({ status: "Speak server is running", version: "2.0" });
+    res.json({ status: "Speak server is running", version: "2.0", timestamp: Date.now() });
 });
 
 app.post("/api/register", async (req, res) => {
@@ -142,9 +141,17 @@ app.post("/api/register", async (req, res) => {
 
         const token = generateSessionToken(userId);
         const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-        await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, userId, expiresAt, Date.now()]);
+        await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', 
+            [token, userId, expiresAt, Date.now()]);
 
-        res.json({ success: true, token, userId, username, displayName, message: "Registration successful" });
+        res.json({ 
+            success: true, 
+            token, 
+            userId, 
+            username, 
+            displayName, 
+            message: "Registration successful" 
+        });
     } catch (err) {
         console.error('Registration error:', err);
         res.status(500).json({ error: "Internal server error" });
@@ -172,11 +179,16 @@ app.post("/api/login", async (req, res) => {
 
         const token = generateSessionToken(user.id);
         const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-        await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, user.id, expiresAt, Date.now()]);
+        await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', 
+            [token, user.id, expiresAt, Date.now()]);
 
         res.json({
-            success: true, token, userId: user.id, username: user.username,
-            display_name: user.display_name, public_key: user.public_key,
+            success: true, 
+            token, 
+            userId: user.id, 
+            username: user.username,
+            display_name: user.display_name, 
+            public_key: user.public_key,
             signature_public_key: user.signature_public_key
         });
     } catch (err) {
@@ -193,6 +205,18 @@ app.post("/api/logout", authMiddleware, async (req, res) => {
 
 app.get("/api/verify", authMiddleware, async (req, res) => {
     res.json({ valid: true, userId: req.userId });
+});
+
+app.get("/api/users", async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, username, display_name, public_key, signature_public_key FROM users_auth ORDER BY username ASC"
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Fetch users error:', err);
+        res.status(500).json({ error: "Internal server error" });
+    }
 });
 
 app.get("/api/public_key/:username", async (req, res) => {
@@ -279,5 +303,15 @@ app.post("/api/change_display_name", authMiddleware, async (req, res) => {
     }
 });
 
+// -------------------------- Запуск сервера --------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+initDb().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 Server running on http://localhost:${PORT}`);
+        console.log(`📡 API available at http://localhost:${PORT}/api`);
+    });
+}).catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+});
