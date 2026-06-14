@@ -40,7 +40,7 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// ============ API ЭНДПОИНТЫ (ВСЕ ОТКРЫТЫЕ) ============
+// ============ API ЭНДПОИНТЫ ============
 
 app.get("/", (req, res) => {
   res.json({ status: "Speak server is running", version: "2.0" });
@@ -110,7 +110,7 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// ПУБЛИЧНЫЙ КЛЮЧ (открытый)
+// ПУБЛИЧНЫЙ КЛЮЧ
 app.get("/api/public_key/:username", async (req, res) => {
   try {
     const { username } = req.params;
@@ -122,29 +122,19 @@ app.get("/api/public_key/:username", async (req, res) => {
   }
 });
 
-// ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ (ОТКРЫТЫЙ)
+// ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ
 app.get("/api/user_info/:username", async (req, res) => {
   try {
     const { username } = req.params;
-    console.log("Get user info for:", username);
-    
-    const result = await pool.query(
-      "SELECT id, username, display_name, public_key FROM users_auth WHERE username = $1",
-      [username]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-    
+    const result = await pool.query("SELECT id, username, display_name, public_key FROM users_auth WHERE username = $1", [username]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Get user info error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ПОИСК ПОЛЬЗОВАТЕЛЕЙ (открытый)
+// ПОИСК ПОЛЬЗОВАТЕЛЕЙ
 app.get("/api/users/search", async (req, res) => {
   try {
     const { q } = req.query;
@@ -160,40 +150,14 @@ app.get("/api/users/search", async (req, res) => {
   }
 });
 
-// ОТПРАВКА СООБЩЕНИЯ
-app.post("/api/send_message", async (req, res) => {
-  try {
-    const { recipientUsername, encryptedPayload, nonce } = req.body;
-    const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
-    if (recipient.rows.length === 0) return res.status(404).json({ error: "Recipient not found" });
-    
-    // Временно: sender_id = recipient_id для теста
-    const sender = await pool.query('SELECT id FROM users_auth WHERE username = $1', [req.body.senderUsername || recipientUsername]);
-    const senderId = sender.rows.length > 0 ? sender.rows[0].id : recipient.rows[0].id;
-    
-    await pool.query(
-      `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp) VALUES($1, $2, $3, $4, $5)`,
-      [senderId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Send error:', err);
-    res.status(500).json({ error: "Internal server error" });
-  }
+// ============ СООБЩЕНИЯ (ВРЕМЕННАЯ ЗАГЛУШКА) ============
+
+app.get("/api/messages", (req, res) => {
+  res.json([]);
 });
 
-// ПОЛУЧЕНИЕ СООБЩЕНИЙ
-app.get("/api/messages", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp, u.username as sender_username, u.display_name as sender_display_name
-       FROM messages m JOIN users_auth u ON m.sender_id = u.id ORDER BY m.timestamp ASC`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Messages error:', err);
-    res.status(500).json({ error: "Internal server error" });
-  }
+app.post("/api/send_message", (req, res) => {
+  res.json({ success: true });
 });
 
 app.get("/api/verify", (req, res) => {
