@@ -86,8 +86,6 @@ app.post("/api/register", async (req, res) => {
   try {
     const { username, password, displayName, publicKey, signaturePublicKey, signaturePrivateKey } = req.body;
     
-    console.log("Register attempt:", username);
-    
     if (!username || !password || !displayName || !publicKey || !signaturePublicKey || !signaturePrivateKey) {
       return res.status(400).json({ error: "All fields required" });
     }
@@ -119,8 +117,6 @@ app.post("/api/register", async (req, res) => {
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
     await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, userId, expiresAt, Date.now()]);
     
-    console.log("User registered:", username);
-    
     res.json({ success: true, token, userId, username, displayName });
   } catch (err) {
     console.error('Registration error:', err);
@@ -132,8 +128,6 @@ app.post("/api/register", async (req, res) => {
 app.post("/api/login", async (req, res) => {
   try {
     const { username, password } = req.body;
-    
-    console.log("Login attempt:", username);
     
     if (!username || !password) {
       return res.status(400).json({ error: "Username and password required" });
@@ -156,14 +150,16 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
     
+    // Обновляем last_login
     await pool.query('UPDATE users_auth SET last_login = $1 WHERE id = $2', [Date.now(), user.id]);
+    
+    // Удаляем старые сессии
     await pool.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at < $2', [user.id, Date.now()]);
     
+    // Создаём новую сессию
     const token = generateSessionToken(user.id);
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
     await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, user.id, expiresAt, Date.now()]);
-    
-    console.log("User logged in:", username);
     
     res.json({ 
       success: true, 
@@ -185,15 +181,12 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/public_key/:username", async (req, res) => {
   try {
     const { username } = req.params;
-    console.log("Get public key for:", username);
-    
     const result = await pool.query("SELECT public_key FROM users_auth WHERE username = $1", [username]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "User not found" });
     }
     res.json({ public_key: result.rows[0].public_key });
   } catch (err) {
-    console.error('Get public key error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -202,15 +195,12 @@ app.get("/api/public_key/:username", async (req, res) => {
 app.get("/api/user_info/:username", async (req, res) => {
   try {
     const { username } = req.params;
-    console.log("Get user info for:", username);
-    
     const result = await pool.query("SELECT id, username, display_name, public_key FROM users_auth WHERE username = $1", [username]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "User not found" });
     }
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Get user info error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -219,18 +209,9 @@ app.get("/api/user_info/:username", async (req, res) => {
 app.get("/api/users/search", async (req, res) => {
   try {
     const { q } = req.query;
-    console.log("Search users for:", q);
-    
-    if (!q || q.length < 2) {
-      return res.json([]);
-    }
-    
+    if (!q || q.length < 2) return res.json([]);
     const result = await pool.query(
-      `SELECT id, username, display_name, public_key 
-       FROM users_auth 
-       WHERE display_name ILIKE $1 
-       ORDER BY display_name ASC 
-       LIMIT 10`,
+      `SELECT id, username, display_name, public_key FROM users_auth WHERE display_name ILIKE $1 ORDER BY display_name ASC LIMIT 10`,
       [`%${q}%`]
     );
     res.json(result.rows);
@@ -244,13 +225,10 @@ app.get("/api/users/search", async (req, res) => {
 app.post("/api/send_message", authMiddleware, async (req, res) => {
   try {
     const { recipientUsername, encryptedPayload, nonce } = req.body;
-    console.log("Send message to:", recipientUsername);
-    
     const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
     if (recipient.rows.length === 0) {
       return res.status(404).json({ error: "Recipient not found" });
     }
-    
     await pool.query(
       `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp) VALUES($1, $2, $3, $4, $5)`,
       [req.userId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
@@ -265,15 +243,9 @@ app.post("/api/send_message", authMiddleware, async (req, res) => {
 // ============ ПОЛУЧИТЬ СООБЩЕНИЯ ============
 app.get("/api/messages", authMiddleware, async (req, res) => {
   try {
-    console.log("Get messages for user:", req.userId);
-    
     const result = await pool.query(
-      `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp, 
-              u.username as sender_username, u.display_name as sender_display_name
-       FROM messages m 
-       JOIN users_auth u ON m.sender_id = u.id 
-       WHERE m.recipient_id = $1 
-       ORDER BY m.timestamp ASC`,
+      `SELECT m.id, m.encrypted_payload, m.nonce, m.timestamp, u.username as sender_username, u.display_name as sender_display_name
+       FROM messages m JOIN users_auth u ON m.sender_id = u.id WHERE m.recipient_id = $1 ORDER BY m.timestamp ASC`,
       [req.userId]
     );
     res.json(result.rows);
@@ -286,15 +258,12 @@ app.get("/api/messages", authMiddleware, async (req, res) => {
 // ============ ПРОВЕРИТЬ ТОКЕН ============
 app.get("/api/verify", authMiddleware, async (req, res) => {
   try {
-    console.log("Verify token for user:", req.userId);
-    
     const result = await pool.query('SELECT id, username, display_name FROM users_auth WHERE id = $1', [req.userId]);
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "User not found" });
     }
     res.json({ valid: true, user: result.rows[0] });
   } catch (err) {
-    console.error('Verify error:', err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -315,7 +284,6 @@ async function startServer() {
     app.listen(PORT, () => console.log(`✅ Speak server running on port ${PORT}`));
   } catch (err) {
     console.error('❌ Database connection error:', err.message);
-    process.exit(1);
   }
 }
 
