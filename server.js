@@ -64,13 +64,9 @@ async function verifySessionToken(token) {
 
 async function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
+  if (!token) return res.status(401).json({ error: 'No token provided' });
   const userId = await verifySessionToken(token);
-  if (!userId) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
+  if (!userId) return res.status(401).json({ error: 'Invalid or expired token' });
   req.userId = userId;
   next();
 }
@@ -81,7 +77,7 @@ app.get("/", (req, res) => {
   res.json({ status: "Speak server is running", version: "2.0", timestamp: Date.now() });
 });
 
-// ============ РЕГИСТРАЦИЯ ============
+// РЕГИСТРАЦИЯ
 app.post("/api/register", async (req, res) => {
   try {
     const { username, password, displayName, publicKey, signaturePublicKey, signaturePrivateKey } = req.body;
@@ -89,20 +85,15 @@ app.post("/api/register", async (req, res) => {
     if (!username || !password || !displayName || !publicKey || !signaturePublicKey || !signaturePrivateKey) {
       return res.status(400).json({ error: "All fields required" });
     }
-    
     if (username.length < 3) return res.status(400).json({ error: "Username too short" });
     if (displayName.length < 2) return res.status(400).json({ error: "Display name too short" });
     if (password.length < 6) return res.status(400).json({ error: "Password too short" });
     
     const existingUser = await pool.query('SELECT id FROM users_auth WHERE username = $1', [username]);
-    if (existingUser.rows.length > 0) {
-      return res.status(409).json({ error: "Username already exists" });
-    }
+    if (existingUser.rows.length > 0) return res.status(409).json({ error: "Username already exists" });
     
     const existingDisplayName = await pool.query('SELECT id FROM users_auth WHERE display_name = $1', [displayName]);
-    if (existingDisplayName.rows.length > 0) {
-      return res.status(409).json({ error: "Display name already taken" });
-    }
+    if (existingDisplayName.rows.length > 0) return res.status(409).json({ error: "Display name already taken" });
     
     const { hash, salt } = await hashPassword(password);
     const userId = crypto.randomBytes(16).toString('hex');
@@ -124,39 +115,26 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-// ============ ЛОГИН ============
+// ЛОГИН
 app.post("/api/login", async (req, res) => {
   try {
     const { username, password } = req.body;
-    
-    if (!username || !password) {
-      return res.status(400).json({ error: "Username and password required" });
-    }
+    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
     
     const result = await pool.query(
       'SELECT id, username, password_hash, display_name, public_key, signature_public_key, signature_private_key FROM users_auth WHERE username = $1',
       [username]
     );
-    
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
+    if (result.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
     
     const user = result.rows[0];
     const [hash, salt] = user.password_hash.split('.');
     const isValid = await verifyPassword(password, hash, salt);
+    if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
     
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-    
-    // Обновляем last_login
     await pool.query('UPDATE users_auth SET last_login = $1 WHERE id = $2', [Date.now(), user.id]);
-    
-    // Удаляем старые сессии
     await pool.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at < $2', [user.id, Date.now()]);
     
-    // Создаём новую сессию
     const token = generateSessionToken(user.id);
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
     await pool.query('INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES($1, $2, $3, $4)', [token, user.id, expiresAt, Date.now()]);
@@ -177,35 +155,31 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// ============ ПОЛУЧИТЬ ПУБЛИЧНЫЙ КЛЮЧ ============
+// ПУБЛИЧНЫЙ КЛЮЧ
 app.get("/api/public_key/:username", async (req, res) => {
   try {
     const { username } = req.params;
     const result = await pool.query("SELECT public_key FROM users_auth WHERE username = $1", [username]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json({ public_key: result.rows[0].public_key });
   } catch (err) {
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ============ ПОЛУЧИТЬ ИНФОРМАЦИЮ О ПОЛЬЗОВАТЕЛЕ ============
+// ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ
 app.get("/api/user_info/:username", async (req, res) => {
   try {
     const { username } = req.params;
-    const result = await pool.query("SELECT id, username, display_name, public_key FROM users_auth WHERE username = $1", [username]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
+    const result = await pool.query("SELECT id, username, display_name FROM users_auth WHERE username = $1", [username]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ============ ПОИСК ПОЛЬЗОВАТЕЛЕЙ ============
+// ПОИСК ПОЛЬЗОВАТЕЛЕЙ
 app.get("/api/users/search", async (req, res) => {
   try {
     const { q } = req.query;
@@ -221,14 +195,12 @@ app.get("/api/users/search", async (req, res) => {
   }
 });
 
-// ============ ОТПРАВИТЬ СООБЩЕНИЕ ============
+// ОТПРАВКА СООБЩЕНИЯ
 app.post("/api/send_message", authMiddleware, async (req, res) => {
   try {
     const { recipientUsername, encryptedPayload, nonce } = req.body;
     const recipient = await pool.query('SELECT id FROM users_auth WHERE username = $1', [recipientUsername]);
-    if (recipient.rows.length === 0) {
-      return res.status(404).json({ error: "Recipient not found" });
-    }
+    if (recipient.rows.length === 0) return res.status(404).json({ error: "Recipient not found" });
     await pool.query(
       `INSERT INTO messages(sender_id, recipient_id, encrypted_payload, nonce, timestamp) VALUES($1, $2, $3, $4, $5)`,
       [req.userId, recipient.rows[0].id, encryptedPayload, nonce || '', Date.now()]
@@ -240,7 +212,7 @@ app.post("/api/send_message", authMiddleware, async (req, res) => {
   }
 });
 
-// ============ ПОЛУЧИТЬ СООБЩЕНИЯ ============
+// ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.get("/api/messages", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -255,20 +227,18 @@ app.get("/api/messages", authMiddleware, async (req, res) => {
   }
 });
 
-// ============ ПРОВЕРИТЬ ТОКЕН ============
+// ПРОВЕРКА ТОКЕНА
 app.get("/api/verify", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, username, display_name FROM users_auth WHERE id = $1', [req.userId]);
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: "User not found" });
-    }
+    if (result.rows.length === 0) return res.status(401).json({ error: "User not found" });
     res.json({ valid: true, user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ============ ВЫХОД ============
+// ВЫХОД
 app.post("/api/logout", authMiddleware, async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
