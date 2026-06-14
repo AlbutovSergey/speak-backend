@@ -1,7 +1,7 @@
 {
   "name": "speak-backend",
   "version": "2.0.0",
-  "description": "Speak Secure Messenger - Backend Server",
+  "description": "Speak Messenger Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
