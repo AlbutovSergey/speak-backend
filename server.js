@@ -6,8 +6,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Временное хранилище в памяти (пока нет базы данных)
+// Временное хранилище в памяти
 const users = new Map();
+const messages = []; // Хранилище сообщений
 
 app.get("/", (req, res) => {
   res.json({ status: "Speak server is running", version: "2.0-test" });
@@ -138,18 +139,14 @@ app.get("/api/users/search", async (req, res) => {
     const results = [];
     
     for (const [username, user] of users) {
-      const displayName = user.displayName || username;
-      const displayNameLower = displayName.toLowerCase().replace(/^@/, '');
-      
-      if (displayNameLower.includes(searchLower) || username.toLowerCase().includes(searchLower)) {
-        if (username !== users.get('currentUser')) {
-          results.push({
-            id: user.userId,
-            username: user.username,
-            display_name: user.displayName || user.username,
-            public_key: user.publicKey
-          });
-        }
+      const displayName = (user.displayName || username).toLowerCase().replace(/^@/, '');
+      if (displayName.includes(searchLower) || username.toLowerCase().includes(searchLower)) {
+        results.push({
+          id: user.userId,
+          username: user.username,
+          display_name: user.displayName || user.username,
+          public_key: user.publicKey
+        });
       }
     }
     
@@ -160,24 +157,112 @@ app.get("/api/users/search", async (req, res) => {
   }
 });
 
-// ============ СООБЩЕНИЯ ============
-app.get("/api/messages", (req, res) => {
-  res.json([]);
-});
-
+// ============ ОТПРАВИТЬ СООБЩЕНИЕ ============
 app.post("/api/send_message", (req, res) => {
-  res.json({ success: true });
+  try {
+    const { recipientUsername, encryptedPayload, nonce } = req.body;
+    const authHeader = req.headers.authorization;
+    let senderUsername = null;
+    
+    // Получаем отправителя из токена (упрощённо)
+    for (const [username, user] of users) {
+      if (authHeader && authHeader.includes(user.userId)) {
+        senderUsername = username;
+        break;
+      }
+    }
+    
+    if (!senderUsername) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    
+    const message = {
+      id: messages.length + 1,
+      sender_username: senderUsername,
+      recipient_username: recipientUsername,
+      encrypted_payload: encryptedPayload,
+      nonce: nonce || '',
+      timestamp: Date.now()
+    };
+    
+    messages.push(message);
+    console.log(`Message from ${senderUsername} to ${recipientUsername}`);
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
+// ============ ПОЛУЧИТЬ СООБЩЕНИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ ============
+app.get("/api/messages", (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    let currentUser = null;
+    
+    // Находим текущего пользователя по токену
+    for (const [username, user] of users) {
+      if (authHeader && authHeader.includes(user.userId)) {
+        currentUser = username;
+        break;
+      }
+    }
+    
+    if (!currentUser) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    
+    // Фильтруем сообщения для текущего пользователя
+    const userMessages = messages.filter(msg => 
+      msg.recipient_username === currentUser || 
+      msg.sender_username === currentUser
+    );
+    
+    // Добавляем информацию об отправителе
+    const result = userMessages.map(msg => {
+      const sender = users.get(msg.sender_username);
+      return {
+        id: msg.id,
+        sender_id: sender?.userId || msg.sender_username,
+        sender_username: msg.sender_username,
+        sender_display_name: sender?.displayName || msg.sender_username,
+        encrypted_payload: msg.encrypted_payload,
+        nonce: msg.nonce,
+        timestamp: msg.timestamp
+      };
+    });
+    
+    res.json(result);
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ПРОВЕРИТЬ ТОКЕН ============
 app.get("/api/verify", (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  res.json({ valid: !!token });
+  let userFound = false;
+  
+  for (const [username, user] of users) {
+    if (token && token.includes(user.userId)) {
+      userFound = true;
+      break;
+    }
+  }
+  
+  res.json({ valid: userFound });
 });
 
+// ============ ВЫХОД ============
 app.post("/api/logout", (req, res) => {
   res.json({ success: true });
 });
 
 // ============ ЗАПУСК ============
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Speak server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Speak server running on port ${PORT}`);
+  console.log(`📊 Users in memory: 0`);
+});
